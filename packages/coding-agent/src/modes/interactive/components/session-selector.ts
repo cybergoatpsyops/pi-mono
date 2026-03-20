@@ -22,13 +22,12 @@ import { filterAndSortSessions, hasSessionName, type NameFilter, type SortMode }
 
 type SessionScope = "current" | "all";
 
-function shortenPath(path: string): string {
+function shortenPath(p: string): string {
 	const home = os.homedir();
-	if (!path) return path;
-	if (path.startsWith(home)) {
-		return `~${path.slice(home.length)}`;
-	}
-	return path;
+	if (!p) return p;
+	if (p === home) return "~";
+	if (p.startsWith(home + "/")) return `~${p.slice(home.length)}`;
+	return p;
 }
 
 function formatSessionDate(date: Date): string {
@@ -55,7 +54,8 @@ class SessionSelectorHeader implements Component {
 	private loading = false;
 	private loadProgress: { loaded: number; total: number } | null = null;
 	private showPath = false;
-	private confirmingDeletePath: string | null = null;
+	private confirmingDeleteCount: number | null = null;
+	private markedCount = 0;
 	private statusMessage: { type: "info" | "error"; message: string } | null = null;
 	private statusTimeout: ReturnType<typeof setTimeout> | null = null;
 	private showRenameHint = false;
@@ -97,8 +97,12 @@ class SessionSelectorHeader implements Component {
 		this.showRenameHint = show;
 	}
 
-	setConfirmingDeletePath(path: string | null): void {
-		this.confirmingDeletePath = path;
+	setConfirmingDeleteCount(count: number | null): void {
+		this.confirmingDeleteCount = count;
+	}
+
+	setMarkedCount(count: number): void {
+		this.markedCount = count;
 	}
 
 	private clearStatusTimeout(): void {
@@ -146,11 +150,13 @@ class SessionSelectorHeader implements Component {
 		const left = truncateToWidth(leftText, availableLeft, "");
 		const spacing = Math.max(0, width - visibleWidth(left) - visibleWidth(rightText));
 
-		// Build hint lines - changes based on state (all branches truncate to width)
 		let hintLine1: string;
 		let hintLine2: string;
-		if (this.confirmingDeletePath !== null) {
-			const confirmHint = `Delete session? ${keyHint("tui.select.confirm", "confirm")} · ${keyHint("tui.select.cancel", "cancel")}`;
+		if (this.confirmingDeleteCount !== null) {
+			const confirmHint =
+				this.confirmingDeleteCount === 1
+					? `Delete session? ${keyHint("tui.select.confirm", "confirm")} · ${keyHint("tui.select.cancel", "cancel")}`
+					: `Delete ${this.confirmingDeleteCount} sessions? ${keyHint("tui.select.confirm", "confirm")} · ${keyHint("tui.select.cancel", "cancel")}`;
 			hintLine1 = theme.fg("error", truncateToWidth(confirmHint, width, "…"));
 			hintLine2 = "";
 		} else if (this.statusMessage) {
@@ -165,7 +171,8 @@ class SessionSelectorHeader implements Component {
 			const hint2Parts = [
 				keyHint("app.session.toggleSort", "sort"),
 				keyHint("app.session.toggleNamedFilter", "named"),
-				keyHint("app.session.delete", "delete"),
+				keyHint("app.session.mark", this.markedCount > 0 ? `mark (${this.markedCount})` : "mark"),
+				keyHint("app.session.delete", this.markedCount > 0 ? `delete ${this.markedCount}` : "delete"),
 				keyHint("app.session.togglePath", `path ${pathState}`),
 			];
 			if (this.showRenameHint) {
@@ -255,6 +262,11 @@ function flattenSessionTree(roots: SessionTreeNode[]): FlatSessionNode[] {
 	return result;
 }
 
+type DeleteConfirmationState = {
+	path: string | null;
+	count: number | null;
+};
+
 /**
  * Custom session list component with multi-line items and search
  */
@@ -273,6 +285,8 @@ class SessionList implements Component, Focusable {
 	private keybindings: KeybindingsManager;
 	private showPath = false;
 	private confirmingDeletePath: string | null = null;
+	private confirmingDeletePaths: string[] | null = null;
+	private markedPaths = new Set<string>();
 	private currentSessionFilePath?: string;
 	public onSelect?: (sessionPath: string) => void;
 	public onCancel?: () => void;
@@ -281,10 +295,12 @@ class SessionList implements Component, Focusable {
 	public onToggleSort?: () => void;
 	public onToggleNameFilter?: () => void;
 	public onTogglePath?: (showPath: boolean) => void;
-	public onDeleteConfirmationChange?: (path: string | null) => void;
+	public onDeleteConfirmationChange?: (state: DeleteConfirmationState) => void;
 	public onDeleteSession?: (sessionPath: string) => Promise<void>;
+	public onBatchDeleteSessions?: (sessionPaths: string[]) => Promise<void>;
 	public onRenameSession?: (sessionPath: string) => void;
 	public onError?: (message: string) => void;
+	public onMarkedCountChange?: (count: number) => void;
 	private maxVisible: number = 10; // Max sessions visible (one line each)
 
 	// Focusable implementation - propagate to searchInput for IME cursor positioning
@@ -339,6 +355,7 @@ class SessionList implements Component, Focusable {
 	setSessions(sessions: SessionInfo[], showCwd: boolean): void {
 		this.allSessions = sessions;
 		this.showCwd = showCwd;
+		this.syncMarkedPaths();
 		this.filterSessions(this.searchInput.getValue());
 	}
 
@@ -366,7 +383,82 @@ class SessionList implements Component, Focusable {
 
 	private setConfirmingDeletePath(path: string | null): void {
 		this.confirmingDeletePath = path;
-		this.onDeleteConfirmationChange?.(path);
+		this.confirmingDeletePaths = null;
+		this.onDeleteConfirmationChange?.({ path, count: path ? 1 : null });
+	}
+
+	private setConfirmingDeletePaths(paths: string[]): void {
+		const next = paths.length > 0 ? [...paths] : null;
+		this.confirmingDeletePath = null;
+		this.confirmingDeletePaths = next;
+		this.onDeleteConfirmationChange?.({ path: null, count: next ? next.length : null });
+	}
+
+	private updateMarkedCount(): void {
+		this.onMarkedCountChange?.(this.markedPaths.size);
+	}
+
+	private syncMarkedPaths(): void {
+		if (this.markedPaths.size === 0) {
+			this.updateMarkedCount();
+			return;
+		}
+
+		const validPaths = new Set(this.allSessions.map((session) => session.path));
+		for (const path of Array.from(this.markedPaths)) {
+			if (!validPaths.has(path)) {
+				this.markedPaths.delete(path);
+			}
+		}
+		this.updateMarkedCount();
+	}
+
+	public removeMarkedPaths(paths: string[]): void {
+		if (this.markedPaths.size === 0 || paths.length === 0) return;
+
+		let changed = false;
+		for (const path of paths) {
+			if (this.markedPaths.delete(path)) {
+				changed = true;
+			}
+		}
+
+		if (changed) {
+			this.updateMarkedCount();
+		}
+	}
+
+	private getMarkedPathsInOrder(): string[] {
+		const orderedPaths: string[] = [];
+		const seen = new Set<string>();
+		for (const session of this.allSessions) {
+			if (this.markedPaths.has(session.path) && !seen.has(session.path)) {
+				orderedPaths.push(session.path);
+				seen.add(session.path);
+			}
+		}
+		return orderedPaths;
+	}
+
+	private toggleMarkedForSelectedSession(): void {
+		const selected = this.filteredSessions[this.selectedIndex];
+		if (!selected) return;
+
+		if (this.currentSessionFilePath && selected.session.path === this.currentSessionFilePath) {
+			this.onError?.("Cannot mark the currently active session");
+			return;
+		}
+
+		if (this.markedPaths.has(selected.session.path)) {
+			this.markedPaths.delete(selected.session.path);
+		} else {
+			this.markedPaths.add(selected.session.path);
+			if (this.selectedIndex < this.filteredSessions.length - 1) {
+				this.selectedIndex += 1;
+			}
+		}
+
+		this.updateMarkedCount();
 	}
 
 	private startDeleteConfirmationForSelectedSession(): void {
@@ -382,10 +474,23 @@ class SessionList implements Component, Focusable {
 		this.setConfirmingDeletePath(selected.session.path);
 	}
 
+	private startDeleteConfirmationForMarkedSessions(): void {
+		const markedPaths = this.getMarkedPathsInOrder();
+		if (markedPaths.length === 0) {
+			this.onError?.("No marked sessions available to delete");
+			return;
+		}
+
+		this.setConfirmingDeletePaths(markedPaths);
+	}
+
 	invalidate(): void {}
 
 	render(width: number): string[] {
 		const lines: string[] = [];
+		const confirmingDeletePathSet = new Set(
+			this.confirmingDeletePaths ?? (this.confirmingDeletePath ? [this.confirmingDeletePath] : []),
+		);
 
 		// Render search input
 		lines.push(...this.searchInput.render(width));
@@ -423,7 +528,8 @@ class SessionList implements Component, Focusable {
 			const node = this.filteredSessions[i]!;
 			const session = node.session;
 			const isSelected = i === this.selectedIndex;
-			const isConfirmingDelete = session.path === this.confirmingDeletePath;
+			const isConfirmingDelete = confirmingDeletePathSet.has(session.path);
+			const isMarked = this.markedPaths.has(session.path);
 			const isCurrent = this.currentSessionFilePath === session.path;
 
 			// Build tree prefix
@@ -445,13 +551,14 @@ class SessionList implements Component, Focusable {
 				rightPart = `${shortenPath(session.path)} ${rightPart}`;
 			}
 
-			// Cursor
+			// Cursor + multi-select marker
 			const cursor = isSelected ? theme.fg("accent", "› ") : "  ";
+			const markPrefix = isMarked ? theme.fg(isConfirmingDelete ? "error" : "accent", "● ") : "  ";
 
 			// Calculate available width for message
 			const prefixWidth = visibleWidth(prefix);
 			const rightWidth = visibleWidth(rightPart) + 2; // +2 for spacing
-			const availableForMsg = width - 2 - prefixWidth - rightWidth; // -2 for cursor
+			const availableForMsg = width - 4 - prefixWidth - rightWidth; // -4 for cursor + mark prefix
 
 			const truncatedMsg = truncateToWidth(normalizedMessage, Math.max(10, availableForMsg), "…");
 
@@ -460,6 +567,8 @@ class SessionList implements Component, Focusable {
 			if (isConfirmingDelete) {
 				messageColor = "error";
 			} else if (isCurrent) {
+				messageColor = "accent";
+			} else if (isMarked) {
 				messageColor = "accent";
 			} else if (hasName) {
 				messageColor = "warning";
@@ -470,7 +579,7 @@ class SessionList implements Component, Focusable {
 			}
 
 			// Build line
-			const leftPart = cursor + theme.fg("dim", prefix) + styledMsg;
+			const leftPart = cursor + markPrefix + theme.fg("dim", prefix) + styledMsg;
 			const leftWidth = visibleWidth(leftPart);
 			const spacing = Math.max(1, width - leftWidth - visibleWidth(rightPart));
 			const styledRight = theme.fg(isConfirmingDelete ? "error" : "dim", rightPart);
@@ -506,11 +615,18 @@ class SessionList implements Component, Focusable {
 		const kb = getKeybindings();
 
 		// Handle delete confirmation state first - intercept all keys
-		if (this.confirmingDeletePath !== null) {
+		if (this.confirmingDeletePath !== null || this.confirmingDeletePaths !== null) {
 			if (kb.matches(keyData, "tui.select.confirm")) {
 				const pathToDelete = this.confirmingDeletePath;
+				const pathsToDelete = this.confirmingDeletePaths ? [...this.confirmingDeletePaths] : null;
 				this.setConfirmingDeletePath(null);
-				void this.onDeleteSession?.(pathToDelete);
+				if (pathsToDelete) {
+					void this.onBatchDeleteSessions?.(pathsToDelete);
+					return;
+				}
+				if (pathToDelete) {
+					void this.onDeleteSession?.(pathToDelete);
+				}
 				return;
 			}
 			if (kb.matches(keyData, "tui.select.cancel")) {
@@ -545,9 +661,19 @@ class SessionList implements Component, Focusable {
 			return;
 		}
 
-		// Ctrl+D: initiate delete confirmation (useful on terminals that don't distinguish Ctrl+Backspace from Backspace)
+		// Ctrl+Space: toggle mark on selected session for batch deletion
+		if (kb.matches(keyData, "app.session.mark")) {
+			this.toggleMarkedForSelectedSession();
+			return;
+		}
+
+		// Ctrl+D: delete marked sessions when present, otherwise delete the selected session
 		if (kb.matches(keyData, "app.session.delete")) {
-			this.startDeleteConfirmationForSelectedSession();
+			if (this.markedPaths.size > 0) {
+				this.startDeleteConfirmationForMarkedSessions();
+			} else {
+				this.startDeleteConfirmationForSelectedSession();
+			}
 			return;
 		}
 
@@ -569,7 +695,11 @@ class SessionList implements Component, Focusable {
 				return;
 			}
 
-			this.startDeleteConfirmationForSelectedSession();
+			if (this.markedPaths.size > 0) {
+				this.startDeleteConfirmationForMarkedSessions();
+			} else {
+				this.startDeleteConfirmationForSelectedSession();
+			}
 			return;
 		}
 
@@ -650,6 +780,17 @@ async function deleteSessionFile(
 		const error = trashErrorHint ? `${unlinkError} (${trashErrorHint})` : unlinkError;
 		return { ok: false, method: "unlink", error };
 	}
+}
+
+async function deleteSessionFiles(
+	sessionPaths: string[],
+): Promise<Array<{ path: string; ok: boolean; method: "trash" | "unlink"; error?: string }>> {
+	const results = [];
+	for (const sessionPath of sessionPaths) {
+		const result = await deleteSessionFile(sessionPath);
+		results.push({ path: sessionPath, ...result });
+	}
+	return results;
 }
 
 /**
@@ -794,8 +935,12 @@ export class SessionSelectorComponent extends Container implements Focusable {
 			this.header.setShowPath(showPath);
 			this.requestRender();
 		};
-		this.sessionList.onDeleteConfirmationChange = (path) => {
-			this.header.setConfirmingDeletePath(path);
+		this.sessionList.onDeleteConfirmationChange = (state) => {
+			this.header.setConfirmingDeleteCount(state.count);
+			this.requestRender();
+		};
+		this.sessionList.onMarkedCountChange = (count) => {
+			this.header.setMarkedCount(count);
 			this.requestRender();
 		};
 		this.sessionList.onError = (msg) => {
@@ -805,33 +950,75 @@ export class SessionSelectorComponent extends Container implements Focusable {
 
 		// Handle session deletion
 		this.sessionList.onDeleteSession = async (sessionPath: string) => {
-			const result = await deleteSessionFile(sessionPath);
-
-			if (result.ok) {
-				if (this.currentSessions) {
-					this.currentSessions = this.currentSessions.filter((s) => s.path !== sessionPath);
-				}
-				if (this.allSessions) {
-					this.allSessions = this.allSessions.filter((s) => s.path !== sessionPath);
-				}
-
-				const sessions = this.scope === "all" ? (this.allSessions ?? []) : (this.currentSessions ?? []);
-				const showCwd = this.scope === "all";
-				this.sessionList.setSessions(sessions, showCwd);
-
-				const msg = result.method === "trash" ? "Session moved to trash" : "Session deleted";
-				this.header.setStatusMessage({ type: "info", message: msg }, 2000);
-				await this.refreshSessionsAfterMutation();
-			} else {
-				const errorMessage = result.error ?? "Unknown error";
-				this.header.setStatusMessage({ type: "error", message: `Failed to delete: ${errorMessage}` }, 3000);
-			}
-
-			this.requestRender();
+			await this.deleteSessions([sessionPath]);
+		};
+		this.sessionList.onBatchDeleteSessions = async (sessionPaths: string[]) => {
+			await this.deleteSessions(sessionPaths);
 		};
 
 		// Start loading current sessions immediately
 		this.loadCurrentSessions();
+	}
+
+	private async deleteSessions(sessionPaths: string[]): Promise<void> {
+		const uniquePaths = [...new Set(sessionPaths)];
+		if (uniquePaths.length === 0) {
+			return;
+		}
+
+		const results = await deleteSessionFiles(uniquePaths);
+		const deletedResults = results.filter((result) => result.ok);
+		const deletedPaths = deletedResults.map((result) => result.path);
+		const failedResults = results.filter((result) => !result.ok);
+		const deletedCount = deletedPaths.length;
+		const failedCount = failedResults.length;
+
+		if (deletedCount > 0) {
+			const deletedPathSet = new Set(deletedPaths);
+			if (this.currentSessions) {
+				this.currentSessions = this.currentSessions.filter((session) => !deletedPathSet.has(session.path));
+			}
+			if (this.allSessions) {
+				this.allSessions = this.allSessions.filter((session) => !deletedPathSet.has(session.path));
+			}
+			this.sessionList.removeMarkedPaths(deletedPaths);
+			const sessions = this.scope === "all" ? (this.allSessions ?? []) : (this.currentSessions ?? []);
+			const showCwd = this.scope === "all";
+			this.sessionList.setSessions(sessions, showCwd);
+		}
+
+		if (failedCount > 0) {
+			if (deletedCount > 0) {
+				this.header.setStatusMessage(
+					{
+						type: "error",
+						message: `Deleted ${deletedCount} session${deletedCount === 1 ? "" : "s"}; ${failedCount} failed`,
+					},
+					4000,
+				);
+			} else {
+				const firstError = failedResults[0]?.error ?? "Unknown error";
+				const suffix = failedCount > 1 ? ` (${failedCount} failures)` : "";
+				this.header.setStatusMessage({ type: "error", message: `Failed to delete: ${firstError}${suffix}` }, 4000);
+			}
+		} else if (deletedCount > 0) {
+			const allTrash = deletedResults.every((result) => result.method === "trash");
+			const infoMessage =
+				deletedCount === 1
+					? allTrash
+						? "Session moved to trash"
+						: "Session deleted"
+					: allTrash
+						? `Moved ${deletedCount} sessions to trash`
+						: `Deleted ${deletedCount} sessions`;
+			this.header.setStatusMessage({ type: "info", message: infoMessage }, 2500);
+		}
+
+		if (deletedCount > 0) {
+			await this.refreshSessionsAfterMutation();
+		}
+
+		this.requestRender();
 	}
 
 	private loadCurrentSessions(): void {
@@ -976,6 +1163,12 @@ export class SessionSelectorComponent extends Container implements Focusable {
 	}
 
 	private async refreshSessionsAfterMutation(): Promise<void> {
+		// Invalidate the inactive scope so next toggle forces a fresh load
+		if (this.scope === "current") {
+			this.allSessions = null;
+		} else {
+			this.currentSessions = null;
+		}
 		await this.loadScope(this.scope, "refresh");
 	}
 
@@ -993,6 +1186,11 @@ export class SessionSelectorComponent extends Container implements Focusable {
 
 			if (!this.allLoading) {
 				void this.loadScope("all", "toggle");
+			} else {
+				// Load already in-flight — show loading state for correct scope
+				this.header.setLoading(true);
+				this.sessionList.setSessions([], true);
+				this.requestRender();
 			}
 			return;
 		}

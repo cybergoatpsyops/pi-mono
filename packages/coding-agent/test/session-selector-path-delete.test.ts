@@ -42,14 +42,15 @@ function makeSession(overrides: Partial<SessionInfo> & { id: string }): SessionI
 }
 
 const CTRL_D = "\x04";
+const CTRL_SPACE = "\x00";
 const CTRL_BACKSPACE = "\x1b[127;5u";
 
 describe("session selector path/delete interactions", () => {
 	const keybindings = new KeybindingsManager();
 
 	beforeEach(() => {
-		// Ensure test isolation: keybindings are a global singleton
-		setKeybindings(new KeybindingsManager());
+		// Ensure test isolation: reuse the same instance for both options and global accessor
+		setKeybindings(keybindings);
 	});
 
 	beforeAll(() => {
@@ -71,8 +72,8 @@ describe("session selector path/delete interactions", () => {
 		await flushPromises();
 
 		const list = selector.getSessionList();
-		const confirmationChanges: Array<string | null> = [];
-		list.onDeleteConfirmationChange = (path) => confirmationChanges.push(path);
+		const confirmationChanges: Array<{ path: string | null; count: number | null }> = [];
+		list.onDeleteConfirmationChange = (state) => confirmationChanges.push(state);
 
 		list.handleInput("a");
 		list.handleInput(CTRL_BACKSPACE);
@@ -95,13 +96,13 @@ describe("session selector path/delete interactions", () => {
 		await flushPromises();
 
 		const list = selector.getSessionList();
-		const confirmationChanges: Array<string | null> = [];
-		list.onDeleteConfirmationChange = (path) => confirmationChanges.push(path);
+		const confirmationChanges: Array<{ path: string | null; count: number | null }> = [];
+		list.onDeleteConfirmationChange = (state) => confirmationChanges.push(state);
 
 		list.handleInput("a");
 		list.handleInput(CTRL_D);
 
-		expect(confirmationChanges).toEqual([sessions[0]!.path]);
+		expect(confirmationChanges).toEqual([{ path: sessions[0]!.path, count: 1 }]);
 	});
 
 	it("enters confirmation mode on Ctrl+Backspace when search query is empty", async () => {
@@ -119,8 +120,8 @@ describe("session selector path/delete interactions", () => {
 		await flushPromises();
 
 		const list = selector.getSessionList();
-		const confirmationChanges: Array<string | null> = [];
-		list.onDeleteConfirmationChange = (path) => confirmationChanges.push(path);
+		const confirmationChanges: Array<{ path: string | null; count: number | null }> = [];
+		list.onDeleteConfirmationChange = (state) => confirmationChanges.push(state);
 
 		let deletedPath: string | null = null;
 		list.onDeleteSession = async (sessionPath) => {
@@ -128,11 +129,93 @@ describe("session selector path/delete interactions", () => {
 		};
 
 		list.handleInput(CTRL_BACKSPACE);
-		expect(confirmationChanges).toEqual([sessions[0]!.path]);
+		expect(confirmationChanges).toEqual([{ path: sessions[0]!.path, count: 1 }]);
 
 		list.handleInput("\r");
-		expect(confirmationChanges).toEqual([sessions[0]!.path, null]);
+		expect(confirmationChanges).toEqual([
+			{ path: sessions[0]!.path, count: 1 },
+			{ path: null, count: null },
+		]);
 		expect(deletedPath).toBe(sessions[0]!.path);
+	});
+
+	it("shows marked count after Ctrl+Space", async () => {
+		const sessions = [makeSession({ id: "a" }), makeSession({ id: "b" })];
+
+		const selector = new SessionSelectorComponent(
+			async () => sessions,
+			async () => [],
+			() => {},
+			() => {},
+			() => {},
+			() => {},
+			{ keybindings },
+		);
+		await flushPromises();
+
+		selector.getSessionList().handleInput(CTRL_SPACE);
+
+		const output = selector.render(120).join("\n");
+		expect(output).toContain("mark (1)");
+		expect(output).toContain("delete 1");
+	});
+
+	it("deletes marked sessions on Ctrl+D when marks exist", async () => {
+		const sessions = [makeSession({ id: "a" }), makeSession({ id: "b" }), makeSession({ id: "c" })];
+
+		const selector = new SessionSelectorComponent(
+			async () => sessions,
+			async () => [],
+			() => {},
+			() => {},
+			() => {},
+			() => {},
+			{ keybindings },
+		);
+		await flushPromises();
+
+		const list = selector.getSessionList();
+		const confirmationChanges: Array<{ path: string | null; count: number | null }> = [];
+		list.onDeleteConfirmationChange = (state) => confirmationChanges.push(state);
+
+		let deletedPaths: string[] | null = null;
+		list.onBatchDeleteSessions = async (sessionPaths) => {
+			deletedPaths = sessionPaths;
+		};
+
+		list.handleInput(CTRL_SPACE);
+		list.handleInput(CTRL_SPACE);
+		list.handleInput(CTRL_D);
+
+		expect(confirmationChanges.at(-1)).toEqual({ path: null, count: 2 });
+
+		list.handleInput("\r");
+		expect(deletedPaths).toEqual([sessions[0]!.path, sessions[1]!.path]);
+	});
+
+	it("does not mark the currently active session", async () => {
+		const sessions = [makeSession({ id: "a" }), makeSession({ id: "b" })];
+		const errors: string[] = [];
+
+		const selector = new SessionSelectorComponent(
+			async () => sessions,
+			async () => [],
+			() => {},
+			() => {},
+			() => {},
+			() => {},
+			{ keybindings },
+			sessions[0]!.path,
+		);
+		await flushPromises();
+
+		const list = selector.getSessionList();
+		list.onError = (message) => errors.push(message);
+
+		list.handleInput(CTRL_SPACE);
+
+		expect(errors).toEqual(["Cannot mark the currently active session"]);
+		expect(selector.render(120).join("\n")).not.toContain("mark (1)");
 	});
 
 	it("does not switch scope back to All when All load resolves after toggling back to Current", async () => {
