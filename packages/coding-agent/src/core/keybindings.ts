@@ -34,6 +34,7 @@ export interface AppKeybindings {
 	"app.tree.unfoldOrDown": true;
 	"app.session.togglePath": true;
 	"app.session.toggleSort": true;
+	"app.session.mark": true;
 	"app.session.rename": true;
 	"app.session.delete": true;
 	"app.session.deleteNoninvasive": true;
@@ -109,6 +110,10 @@ export const KEYBINDINGS = {
 		defaultKeys: "ctrl+s",
 		description: "Toggle session sort mode",
 	},
+	"app.session.mark": {
+		defaultKeys: "ctrl+space",
+		description: "Toggle mark on session for batch operations",
+	},
 	"app.session.rename": {
 		defaultKeys: "ctrl+r",
 		description: "Rename session",
@@ -178,6 +183,7 @@ const KEYBINDING_NAME_MIGRATIONS = {
 	treeUnfoldOrDown: "app.tree.unfoldOrDown",
 	toggleSessionPath: "app.session.togglePath",
 	toggleSessionSort: "app.session.toggleSort",
+	markSession: "app.session.mark",
 	renameSession: "app.session.rename",
 	deleteSession: "app.session.delete",
 	deleteSessionNoninvasive: "app.session.deleteNoninvasive",
